@@ -130,7 +130,13 @@ span.checkboxevent
 const Cc = Components.classes;
 const Ci = Components.interfaces;
 const Cu = Components.utils;
-const VisualEventTracerService = Cc["@mozilla.org/base/visual-event-tracer;1"].getService(Ci.nsIVisualEventTracer);
+const VisualEventTracerService = (function () {
+  try {
+    return Cc["@mozilla.org/base/visual-event-tracer;1"].getService(Ci.nsIVisualEventTracer);
+  } catch (exc) {
+    return undefined;
+  }
+})();
 
 Cu.import("resource://gre/modules/Services.jsm");
 
