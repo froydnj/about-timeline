@@ -1274,11 +1274,32 @@ function doStopTracing()
   }
 }
 
+function doInputFile(input)
+{
+  var file = input.files.item(0);
+  if (!file)
+    return;
+
+  var reader = new FileReader();
+  reader.onload = function (event) {
+    try {
+      updateFileInNameSwitch();
+      processLog(event.target.result);
+    } catch (exc) {
+      alert("Something went wrong: " + exc.stack);
+    }
+  }
+  reader.readAsText(file, "utf-8");
+}
+
 </script>
 </head>
 <body onload="onLoad()" onresize="onResize()">
         <div id="menu" 
              style="margin-top: 10px; margin-bottom: 10px; padding: 6px; border: solid 1px lightgray;">
+	  <form id="controls">
+	    <label>File to process: <input type="file" onchange="doInputFile(this)" id="fileinput"/></label>
+	  </form>
                 <span class="button_h" onclick="doStartTracing(this)" id="startbtn">Start</span>
                 <span class="button_h hidden" onclick="doStopTracing(this)" id="stopbtn">Stop</span>
                 <span class="button" onclick="doFilterEvents(this)">filter events</span>
