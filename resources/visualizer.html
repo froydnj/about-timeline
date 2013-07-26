@@ -1096,10 +1096,6 @@ function onResize()
 
 function onLoad()
 {
-  if (!VisualEventTracerService) {
-    alert("This build of firefox doesn't support visual event tracer.\nYou must build with --enable-visual-event-tracer option.");
-    return;
-  }
   updateFileInNameSwitch();
 }
 
@@ -1227,8 +1223,19 @@ function updateFileInNameSwitch()
         document.getElementById("showFileInName").checked = showFileInName;
 }
 
+function checkForVisualEventTracerService() {
+  if (!VisualEventTracerService) {
+    alert("This build of firefox doesn't support visual event tracer.\nYou must build with --enable-visual-event-tracer option.");
+    return false;
+  }
+  return true;
+}
+
 function doStartTracing()
 {
+  if (!checkForVisualEventTracerService()) {
+    return;
+  }
   try {
     VisualEventTracerService.start(backlog);
     echo("Trace is running with backlog of "+backlog+"s,<br/>do your intended actions...");
@@ -1241,6 +1248,9 @@ function doStartTracing()
 
 function doStopTracing()
 {
+  if (!checkForVisualEventTracerService()) {
+    return;
+  }
   try {
     try {
       VisualEventTracerService.stop();
