@@ -1,0 +1,1282 @@
+<!DOCTYPE html>
+
+<!--
+  (C) 2012 Jan Bambas, www.janbambas.cz
+  Free to distribute without modifications to this copyright header.
+-->
+
+<head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<title>Mozilla Visual Event Tracer</title>
+<script>
+  Timeline_ajax_url="resource://visual-event-tracer-addon/resources/timeline/src/ajax/api/simile-ajax-api.js";
+  Timeline_urlPrefix='resource://visual-event-tracer-addon/resources/timeline/src/webapp/api/';
+</script>
+<script src="resource://visual-event-tracer-addon/resources/timeline/src/webapp/api/timeline-api.js"></script>
+<style id="_style">
+html
+{
+        font-family: Arial;
+        font-size: 9px;
+}
+
+.timeline-event-tape,
+.timeline-small-event-tape,
+.timeline-small-event-icon
+{
+        background-color:#bd0000;
+        overflow:hidden;
+}
+.timeline-band-layer-inner
+{
+        overflow-y: scroll;
+        overflow-x: hidden;
+}
+#profiler-timeline
+{
+        overflow-x:hidden; overflow-y:scroll;
+}
+.profiler-container
+{
+        margin-left: 10px;
+        margin-right: 10px;
+}
+.pr-band-title
+{
+        position: absolute;
+        left: 0px;
+        z-index: 500;
+        opacity: 0.4;
+        padding: 6px;
+        font-size: 22px;
+}
+span.button_h,
+span.button,
+a.button
+{
+        font-size: 14px;
+        cursor: pointer;
+        text-decoration: underline;
+        margin-right: 5px;
+        margin-left: 5px;
+        color: gray;
+}
+span.button_h.hidden
+{
+        display: none;
+}
+span.button_h
+{
+        box-shadow:inset 0px 1px 2px 0px #f2ecc2;
+        background:-moz-linear-gradient( center top, #ffbd66 5%, #ff6224 100% );
+        background-color:#ffbd66;
+        border-radius:2px;
+        border:1px solid #ffaa22;
+        display:inline-block;
+        color:#ffffff;
+        font-family:arial;
+        font-size:13px;
+        font-weight:bold;
+        padding:6px 18px;
+        text-decoration:none;
+        text-shadow:0px 1px 2px #737373;
+        width: 4em;
+        text-align: center;
+}
+span.button_h:hover 
+{
+        background:-moz-linear-gradient( center top, #ff6224 5%, #ffbd66 100% );
+        background-color:#ff6224;
+}
+span.button_h:active 
+{
+        position:relative;
+        top:1px;
+}
+input.filter
+{
+        border: none;
+        border-bottom: solid thin gray;
+}
+#menu
+{
+        color: gray;
+}
+#log
+{
+        float: right;
+        color: black;
+        font-size: 12px;  
+        font-weight: bold;
+        font-style: italic;
+}
+.timeline-event-highlight
+{
+        overflow: visible;
+}
+span.checkboxnamespace
+{
+        font-size: 14px;
+        font-weight: bold;
+}
+span.checkboxevent
+{
+        padding-left: 1em;
+}
+</style>
+<script>
+
+const Cc = Components.classes;
+const Ci = Components.interfaces;
+const Cu = Components.utils;
+const VisualEventTracerService = Cc["@mozilla.org/base/visual-event-tracer;1"].getService(Ci.nsIVisualEventTracer);
+
+Cu.import("resource://gre/modules/Services.jsm");
+
+const kCoalesceThershold = 2; // ms, single shot events going 2 ms one by one will convert to "Nx event name" with an overall duration
+const kParallelCoalesceThreshold = 1; // ms, parallel events differing by 1 ms tops by each mark will be coalesced
+const kMakeSingleThreshold = 0; // ms, events shorter or taking 0 ms will be converted to single shot events (to have a nice icon)
+
+const kThreadOrdering = [
+        "main thread",
+        "socket thread",
+        "cache i/o",
+        "streamtrans"
+      ];
+
+
+const kFlagThreadSafe = 0x0001;
+
+const kHighlightColor = "#d8ff60";
+
+var timeline = null;
+var bandInfos = [];
+var activeEvent = 
+{
+        evt: null,
+        filter: ""
+};
+var anchor = 0;
+var showFileInName = false;
+var backlog = 30;
+
+function _escapeRegExp(raw)
+{
+        var result = raw
+        .replace(/\\/g, "\\\\")
+        .replace(/\?/g, "\\?")
+        .replace(/\./g, "\\.")
+        .replace(/\+/g, "\\+")
+        .replace(/\*/g, "\\*")
+        .replace(/\^/g, "\\^")
+        .replace(/\$/g, "\\$")
+        .replace(/\(/g, "\\(")
+        .replace(/\)/g, "\\)")
+        .replace(/\[/g, "\\[")
+        .replace(/\]/g, "\\]")
+        .replace(/\|/g, "\\|")
+        ;
+        return result;
+}
+
+var filtering =
+{
+        _resource_elements: {},
+        _events: {},
+        _namespaces: {},
+        
+        _resourceFilter: "",
+        _resourceFilterRegExp: null,
+
+        parseResourceName: function(resourceName)
+        {
+                var URL = resourceName.match(/([\w\d_-]+):(?:(?:\/\/)([\w\d_-]+(?:\.[\w\d_-]+)+))(\/.*)?(\/[^\/]*)$/);
+                if (URL)
+                        return { scheme: URL[1], host: URL[2], path: (URL[3] || "") + (URL[4] || ""), file: URL[4] };
+                var SCHEMEPATH = resourceName.match(/([\w\d_-]+):(\/.*)(\/[^\/]*)$/);
+                if (SCHEMEPATH)
+                        return { scheme: SCHEMEPATH[1], host: "", path: (SCHEMEPATH[2] || "") + (SCHEMEPATH[3] || ""), file: SCHEMEPATH[3] };
+                var HOSTPATH = resourceName.match(/^([\w\d_-]+(?:\.[\w\d_-]+)+)(\/.*)?(\/[^\/]*)$/);
+                if (HOSTPATH)
+                        return { scheme: "", host: HOSTPATH[1], path: HOSTPATH[2], file: HOSTPATH[3] };
+                var HOST = resourceName.match(/^([\w\d_-]+(?:\.[\w\d_-]+)+)$/);
+                if (HOST)
+                        return { scheme: "", host: HOST[1], path: "" };
+                return { text: resourceName };
+        },
+
+        record: function(resourceName, eventName)
+        {
+                this._recordNamespace("", eventName);
+                var res = this.parseResourceName(resourceName);
+                if (res.host)
+                        this._record(res.host, eventName);
+                /*
+                if (res.path)
+                        this.record(res.path, eventName); // Parse path again...
+                */
+                if (res.file)
+                        this._record(res.file, eventName);
+                if (res.text)
+                        this._record(res.text, eventName);
+        },
+        
+        _record: function(resourceElement, eventName)
+        {
+                this._events[eventName] = true;
+                if (resourceElement.length > 1)
+                        this._resource_elements[resourceElement] = true;
+        },
+        
+        _recordNamespace: function(prefix, eventNameSnippet)
+        {
+                var namespace = eventNameSnippet.match(/([^:]*::)(.*$)/);
+                if (namespace) {
+                    this._namespaces[prefix + namespace[1]] = true;
+                    this._recordNamespace(prefix + namespace[1], namespace[2]);
+                }
+        },
+
+        isEventEnabled: function(eventName)
+        {
+                return this._events[eventName] || this._namespaces[eventName];
+        },
+        
+        isNamespaceEnabled: function(prefix, eventNameSnippet)
+        {
+                if (!eventNameSnippet)
+                    return true;
+
+                var namespace = eventNameSnippet.match(/([^:]*::)(.*$)/);
+                if (namespace) {
+                    if (!this._namespaces[prefix + namespace[1]])
+                        return false;
+                    return this.isNamespaceEnabled(prefix + namespace[1], namespace[2]);
+                }
+                return true;
+        },
+
+        enableEventOrNamespace: function(eventName, enable)
+        {
+                if (eventName in this._namespaces) {
+                    for (var event in this._events) {
+                        if (event.match(new RegExp("^" + eventName)))
+                            this._events[event] = enable;
+                    }
+                    for (var ns in this._namespaces) {
+                        if (ns.match(new RegExp("^" + eventName)))
+                            this._namespaces[ns] = enable;
+                    }
+                }
+                else
+                    this._events[eventName] = enable;
+        },
+        
+        filterResourceByHash: function()
+        {
+                var hash = location.hash;
+                if (hash)
+                        hash = hash.substring(1);
+                hash = decodeURI(hash);
+                this.filterResource(hash);
+        },
+        
+        filterResource: function(resourceName)
+        {
+                if (resourceName == this._resourceFilter)
+                        return;
+                        
+                var filter = _escapeRegExp(resourceName);
+                this._resourceFilter = resourceName;
+                this._resourceFilterRegExp = new RegExp(filter, "");
+
+                // XXX Disabled, hash should be used for selecting an event
+                // window.location.hash = encodeURI(this._resourceFilter);
+                //
+                // TODO: evt.click() ; evt.makeVisible() - needs to do something like this anyway
+                //
+                
+                timeline.paint();
+                SimileAjax.WindowManager.cancelPopups();
+        },
+
+        checkEvt: function(evt)
+        {
+                // Check if the event is not excluded
+                if (!this.isEventEnabled(evt.getEventID().name))
+                        return false;
+
+                // Check resource filters (no filter means all resources visible)
+                if (!this._resourceFilter)
+                        return true;
+
+                return this._resourceFilter.match(new RegExp(_escapeRegExp(evt.getDescription()), "g")) || 
+                       this._resourceFilterRegExp.test(evt.getDescription());
+        },
+        
+        getResourceElements: function()
+        {
+                var resources = [];
+                for (var resourceName in this._resource_elements)
+                        resources.push(resourceName)
+                resources.sort();
+                return resources;
+        },
+
+        getEventNames: function()
+        {
+                var events = [];
+                for (var eventName in this._events)
+                        events.push(eventName)
+                for (var namespace in this._namespaces)
+                        events.push(namespace)
+                events.sort();
+                return events;
+        },
+}
+
+scrollState = {
+        save: function()
+        {
+                for (var bandIndex in bandInfos)
+                {
+                        var band = timeline.getBand(bandIndex);
+                        band.__scrollTop = band.getEventPainter()._eventLayer.scrollTop;
+                }
+        },
+        
+        load: function()
+        {
+                for (var bandIndex in bandInfos)
+                {
+                        var band = timeline.getBand(bandIndex);
+                        band.getEventPainter()._eventLayer.scrollTop = band.__scrollTop;
+                }
+        }
+};
+
+
+// Adjustments to Timeline code
+
+Timeline.GregorianDateLabeller.prototype.labelPrecise = function(date)
+{
+        return date.getTime();
+};
+
+Timeline.DefaultEventSource.Event.prototype.fillTime = function(elmt, labeller)
+{
+        function _duration(end, start)
+        {
+                return new Date(end.getTime() - start.getTime());
+        }
+
+        if (this._instant)
+        {
+                if (this.isImprecise())
+                {
+                        elmt.appendChild(elmt.ownerDocument.createTextNode(
+                                "Wait between: " + labeller.labelPrecise(_duration(this._start, anchor)) +
+                                " - " + labeller.labelPrecise(_duration(this._end, anchor)) +
+                                " (" + labeller.labelPrecise(_duration(this._end, this._start)) + "ms)"));
+                }
+                else
+                {
+                        elmt.appendChild(elmt.ownerDocument.createTextNode(
+                                "Execution at: " + labeller.labelPrecise(_duration(this._start, anchor)) + " (0ms)"));
+                }
+        }
+        else
+        {
+                if (this.isImprecise())
+                {
+                        elmt.appendChild(elmt.ownerDocument.createTextNode(
+                                "Wait between: " + labeller.labelPrecise(_duration(this._start, anchor)) +
+                                " - " + labeller.labelPrecise(_duration(this._latestStart, anchor)) +
+                                " (" + labeller.labelPrecise(_duration(this._latestStart, this._start)) + "ms)"));
+
+                        elmt.appendChild(elmt.ownerDocument.createElement("br"));
+                        elmt.appendChild(elmt.ownerDocument.createTextNode(
+                                "Execution between: " + labeller.labelPrecise(_duration(this._latestStart, anchor)) +
+                                " - " + labeller.labelPrecise(_duration(this._end, anchor)) +
+                                " (" + labeller.labelPrecise(_duration(this._end, this._latestStart)) + "ms)"));
+                }
+                else
+                {
+                        elmt.appendChild(elmt.ownerDocument.createTextNode(
+                                "Execution between: " + labeller.labelPrecise(_duration(this._start, anchor)) +
+                                " - " + labeller.labelPrecise(_duration(this._end, anchor)) +
+                                " (" + labeller.labelPrecise(_duration(this._end, this._start)) + "ms)"));
+                }
+        }
+};
+
+Timeline.DefaultEventSource.Event.prototype.fillInfoBubble_old = Timeline.DefaultEventSource.Event.prototype.fillInfoBubble;
+Timeline.DefaultEventSource.Event.prototype.fillInfoBubble = function(elmt, theme, labeller) 
+{
+        Timeline.DefaultEventSource.Event.prototype.fillInfoBubble_old.apply(this, [elmt, theme, labeller]);
+        
+        var poster = this.getEventID().poster;
+        if (poster)
+        {
+                var postedFrom = document.createElement("span");
+                postedFrom.innerHTML = "Posted from: " + poster.name;
+                
+                elmt.appendChild(postedFrom);
+        }
+
+        var buttonContainer = document.createElement("div");
+        buttonContainer.style.textAlign = "center";
+        buttonContainer.style.display = "block";
+        buttonContainer.style.padding = "15px";
+        
+        var filter = document.createElement("button");
+        var unfilter = (filtering._resourceFilter == this.getDescription());
+        filter.innerHTML = unfilter ? "Unfilter" : "Filter";
+        var evt = this;
+        filter.onclick = function()
+        {
+                filtering.filterResource(unfilter ? "" : evt.getDescription());
+        }
+        
+        buttonContainer.appendChild(filter);
+
+        var anchorbtt = document.createElement("button");
+        anchorbtt.innerHTML = "Zero time";
+        anchorbtt.onclick = function()
+        {
+                anchor = evt._start;
+                SimileAjax.WindowManager.cancelPopups();
+                for (var bandInfoIndex in bandInfos)
+                {
+                        var bandInfo = bandInfos[bandInfoIndex];
+                        var span;
+                        span = bandInfo.decorators[2];
+                        span._startDate = new Date(anchor.getTime() - 10);
+                        span._endDate = anchor;
+                        span._color = "green";
+                        span.paint();
+                }
+        }
+        
+        buttonContainer.appendChild(anchorbtt);
+
+        elmt.appendChild(buttonContainer);
+        
+        var mxr = document.createElement("a");
+        mxr.target = "_blank";
+        mxr.href = "http://mxr.mozilla.org/mozilla-central/search?string=%22"+this.getEventID().name+"%22";
+        mxr.innerHTML = "mxr";
+        elmt.appendChild(mxr);
+};
+
+Timeline.DefaultEventSource.Event.prototype.getText_old = Timeline.DefaultEventSource.Event.prototype.getText;
+Timeline.DefaultEventSource.Event.prototype.getText = function()
+{
+        if (showFileInName)
+        {
+                var appendix = filtering.parseResourceName(this._description);
+                appendix = appendix.file ? (" ( " + appendix.file + " )") : "";
+                return Timeline.DefaultEventSource.Event.prototype.getText_old.apply(this) + appendix;
+        }
+        else
+        {
+                return Timeline.DefaultEventSource.Event.prototype.getText_old.apply(this);
+        }
+};
+
+Timeline.OriginalEventPainter.prototype._paintEventLabel_old = Timeline.OriginalEventPainter.prototype._paintEventLabel;
+Timeline.OriginalEventPainter.prototype._paintEventLabel = function(evt, text, left, top, width,
+    height, theme, labelDivClassName, highlightIndex)
+{
+        var result = Timeline.OriginalEventPainter.prototype._paintEventLabel_old.apply(this,
+                                [evt, text, left, top, width,
+                                 height, theme, labelDivClassName, highlightIndex]);
+        result.elmt.style.backgroundColor = (highlightIndex >= 0) ? kHighlightColor : "";
+        return result;
+}
+
+Timeline.OriginalEventPainter.prototype._createHighlightDiv = function()
+{
+        return null;
+}
+
+Timeline.OverviewEventPainter.prototype._createHighlightDiv = function()
+{
+        return null;
+}
+
+// To order the events from top to bottom...
+Timeline.DefaultEventSource.prototype.getEventReverseIterator = Timeline.DefaultEventSource.prototype.getEventIterator;
+
+// Enhance the click handler
+Timeline.OriginalEventPainter.prototype._showBubble_old = Timeline.OriginalEventPainter.prototype._showBubble;
+Timeline.OriginalEventPainter.prototype._showBubble = function(x, y, evt) {
+        // XXX OnSelect is the way here.
+        for (var bandInfoIndex in bandInfos)
+        {
+                var bandInfo = bandInfos[bandInfoIndex];
+                if (evt._instant)
+                {
+                        var span;
+                        span = bandInfo.decorators[0];
+                        span._startDate = evt._start;
+                        span._endDate = new Date(evt._start.getTime() + 1);
+                        span._color = "black";
+                        span.paint();
+
+                        span = bandInfo.decorators[1];
+                        span._startDate = new Date(0);
+                        span._endDate = new Date(0);
+                        span.paint();
+                }
+                else
+                {
+                        var span;
+                        span = bandInfo.decorators[0];
+                        span._startDate = evt._latestStart || evt._start;
+                        span._endDate = evt._end || evt._start;
+                        span._color = "white";
+                        span.paint();
+
+                        span = bandInfo.decorators[1];
+                        if (evt._latestStart && evt._start)
+                        {
+                                span._startDate = evt._start;
+                                span._endDate = evt._latestStart;
+                                span._color = "white";
+                        }
+                        else
+                        {
+                                span._startDate = new Date(0);
+                                span._endDate = new Date(0);
+                        }
+                        span.paint();
+                }
+        }
+
+        Timeline.OriginalEventPainter.prototype._showBubble_old.apply(this, [x, y, evt]);
+}
+
+Timeline._Band.prototype._onDblClick = function()
+{
+        // Disable dblclick, there is a bug with drawing spans after dblclick
+}
+
+Timeline.OriginalEventPainter.prototype._fireOnSelect = function(eventIDs) {
+    for (var i = 0; i < this._onSelectListeners.length; i++) {
+        this._onSelectListeners[i](eventIDs, this);
+    }
+}; 
+
+function filterMatcher(evt)
+{
+        return filtering.checkEvt(evt);
+}
+
+function selectionHook(eventID, painter)
+{
+        var event = painter._band.getEventSource().getEvent(eventID);
+        activeEvent.evt = event;
+        var desc = event.getDescription();
+        activeEvent.filter = new RegExp(_escapeRegExp(filtering.parseResourceName(desc).file || desc), "g");
+        scrollState.save();
+        timeline.paint();
+        scrollState.load();
+}
+
+function highlightMatcher(evt)
+{
+        if (!activeEvent.evt)
+                return -1;
+
+        if (activeEvent.filter.test(evt.getDescription()))
+                return 0;
+        
+        return -1;
+}
+
+function setTimelineHeight()
+{
+        var height = window.innerHeight;
+        var tl_el = document.getElementById("profiler-timeline");
+        tl_el.style.height = (height - 80) + "px";
+}
+
+function setupTimeline(inter)
+{
+        if (timeline) {
+          
+        }
+
+        var threadNamesOrdered = [];
+        bandInfos = [];
+
+        var zeroDate = new Date();
+        zeroDate.setTime(0);
+
+        var theme = Timeline.ClassicTheme.create();
+        theme.mouseWheel = "default";
+        theme.event.tape.height = 2;
+        theme.event.track.height = 1;
+        theme.event.track.gap = 0.1;
+
+        theme.timeline_start = inter.startTime;
+        theme.timeline_stop = inter.endTime;
+
+        decorators = function()
+        {
+                return [
+                        new Timeline.SpanHighlightDecorator({
+                                        startDate: zeroDate,
+                                        endDate: zeroDate,
+                                        opacity: 70,
+                                        theme: theme
+                        }),
+                        new Timeline.SpanHighlightDecorator({
+                                        startDate: zeroDate,
+                                        endDate: zeroDate,
+                                        opacity: 40,
+                                        theme: theme
+                        }),
+                        new Timeline.SpanHighlightDecorator({
+                                        startDate: zeroDate,
+                                        endDate: zeroDate,
+                                        opacity: 50,
+                                        theme: theme
+                        })
+                ];
+        }
+
+        function createThreadBands(thread)
+        {
+                if (thread.banded)
+                        return;
+
+                thread.banded = true;
+                threadNamesOrdered.push(thread.name);
+
+                var eventSource = new Timeline.DefaultEventSource();
+                thread.eventSource = eventSource;
+
+                var overview = Timeline.createBandInfo({
+                                overview:       true,
+                                eventSource:    eventSource,
+                                date:           zeroDate,
+                                width:          "70px",
+                                theme:          theme,
+                                intervalUnit:   Timeline.DateTime.SECOND,
+                                intervalPixels: 100,
+                        });
+                var main = Timeline.createBandInfo({
+                                eventSource:    eventSource,
+                                date:           zeroDate,
+                                width:          "250px",
+                                theme:          theme,
+                                intervalUnit:   Timeline.DateTime.MILLISECOND,
+                                multiple:       200,
+                                intervalPixels: 1,
+                        });
+
+                overview.highlight = true;
+                overview.syncWith = 1;
+                if (bandInfos.length > 0)
+                        main.syncWith = 0;
+
+                overview.decorators = decorators();
+                main.decorators = decorators();
+
+                var style = document.getElementById("_style");
+                style.innerHTML += ".timeline-band-" + bandInfos.length + " .timeline-ether-bg {background-color: " + _colorHash(thread.name, 0x808080) + "}\n";
+                bandInfos.push(overview);
+                style.innerHTML += ".timeline-band-" + bandInfos.length + " .timeline-ether-bg {background-color: " + _colorHash(thread.name, 0xb0b0b0) + "}\n";
+                bandInfos.push(main);
+        }
+
+        for (var orderIndex in kThreadOrdering)
+        {
+                var preferedThread = kThreadOrdering[orderIndex];
+                for (var threadIndex in inter.threads)
+                {
+                        var thread = inter.threads[threadIndex];
+                        var prefix = thread.name.substr(0, preferedThread.length).toLowerCase();
+                        if (prefix == preferedThread)
+                                createThreadBands(thread);
+                }
+        }
+
+        for (var threadIndex in inter.threads)
+        {
+                var thread = inter.threads[threadIndex];
+                createThreadBands(thread);
+        }
+
+        setTimelineHeight();
+        var tl_el = document.getElementById("profiler-timeline");
+        timeline = Timeline.create(tl_el, bandInfos);
+
+        for (var bandIndex in bandInfos)
+        {
+                var band = timeline.getBand(bandIndex);
+                band.getEventPainter().setFilterMatcher(filterMatcher);
+                band.getEventPainter().setHighlightMatcher(highlightMatcher);
+               
+                band.getEventPainter().addOnSelectListener(selectionHook);
+        }
+        
+        timeline.getBand(0).setCenterVisibleDate(inter.firstInterestingEvent);
+
+        for (var threadNameIndex in threadNamesOrdered)
+        {
+                var threadName = threadNamesOrdered[threadNameIndex];
+                var bandId = "timeline-band-" + (threadNameIndex * 2);
+                var band_el = document.getElementById(bandId);
+                var top = band_el.offsetTop;
+                var band_title_el = document.createElement("div");
+                band_title_el.className = "pr-band-title";
+                band_title_el.style.top = top + "px";
+                band_title_el.innerHTML = threadName;
+                tl_el.appendChild(band_title_el);
+        }
+}
+
+function _colorHash(text, add)
+{
+        var color = 0x143103;//0x764237;
+        var component = 0;
+        var length = text.length;
+        for (var index = 0; index < length; ++index)
+        {
+                var charCode = text.charCodeAt(index);
+                if (charCode == "#".charCodeAt(0))
+                        break;
+                color ^= charCode << component;
+                component += 8;
+                if (component == 24)
+                        component = 0;
+        }
+
+        if (add)
+                color |= add;
+
+        color = '#' + color.toString(16);
+        return color;
+}
+
+function _ensureEvent(inter, raw)
+{
+        var key = ((raw.f & kFlagThreadSafe) ? raw.thread.name : "") + " @@ " + raw.i + " @@ " + raw.n;
+        if (key in inter.events)
+                return inter.events[key];
+
+        var desc = inter.bindings[raw.i] || "nameless instance";
+        var eventArgs =
+        {
+                id: undefined,
+                start: null,
+                end: null,
+                latestStart: null,
+                earliestEnd: null,
+                instant: false,
+                text: raw.n,
+                description: desc,
+                image: null,
+                link: null,
+                icon: "data:img/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAMAAAC67D+PAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAADBQTFRFxllL57q02ZCH3ZuTuTUk/fn5rxcDz3Vp89vY8tjVsyIPsh8M+e7tvkMzrhQA////+wHVOwAAABB0Uk5T////////////////////AOAjXRkAAABASURBVHjaPMaHEQAxCANBOYfnUf/d2jjdDGjBF8J/CpCuq09Av+kJpmiKaZLO6GgkVNfMqzm3Q5bCSxH7Q4ABAAoPBN1Uy0ZtAAAAAElFTkSuQmCC",
+                color: _colorHash(raw.n),
+                textColor: null,
+                hoverText: null,
+                classname: null,
+                tapeImage: null,
+                tapeRepeat: null,
+                caption: desc,
+                eventID: {poster: null, name: raw.n, desc: desc},
+                trackNum: null,
+
+                // For internal purposes
+                __pr__key: key,
+                __pr__coalescing: 0,
+                __pr__parallel: 0,
+                __pr__raw: raw,
+                __pr__execution_thread: null
+        };
+
+        // Call .record() to parse resource elements for autocomplete
+        filtering.record(eventArgs.description, raw.n);
+
+        inter.events[key] = eventArgs;
+        return eventArgs;
+}
+
+function _sanitizeEvent(inter, event)
+{
+        if (!event.start)
+                event.start = event.latestStart || event.end;
+
+        if (!event.__pr__execution_thread)
+                event.__pr__execution_thread = event.__pr__raw.thread;
+
+        // Turn very short events to single shots
+        var dur = event.end - event.start;
+        if (dur <= kMakeSingleThreshold)
+        {
+                event.latestStart = null;
+                event.earliestEnd = null;
+                event.end = null;
+        }
+
+        var key = event.__pr__execution_thread.name + " ## " + event.__pr__raw.n + " ## " + event.description;
+        if (event.end == null) // single point event, serial coalescing to "Nx event name"
+        {
+                var coalesce = inter.coalesces[key];
+                if (coalesce)
+                {
+                        if (((event.start.getTime() - coalesce.start.getTime()) <= kCoalesceThershold) ||
+                             (coalesce.end && ((event.start.getTime() - coalesce.end.getTime()) <= kCoalesceThershold)))
+                        {
+                                // coalesce by turning the previous event to an interval
+                                // ending where the current event starts
+                                var dur = event.start - coalesce.start;
+                                if (dur > kMakeSingleThreshold)
+                                        coalesce.end = new Date(event.start.getTime());
+                                ++coalesce.__pr__coalescing;
+                                coalesce.text = (coalesce.__pr__coalescing + 1) + "x " + coalesce.__pr__raw.n;
+                                return false; // coalesced
+                        }
+                }
+
+                inter.coalesces[key] = event;
+        }
+        else // interval, parallel coalescing to "N parallel event name"
+        {
+                var coalesce = inter.parallels[key];
+                if (coalesce)
+                {
+                        function inRange(m1, m2, threshold)
+                        {
+                                if ((m1 == null) != (m2 == null))
+                                        return false;
+                                if (!m1)
+                                        return true;
+                                var diff = m1.getTime() - m2.getTime();
+                                return Math.abs(diff) <= threshold;
+                        }
+
+                        if (inRange(event.start,       coalesce.start,       kParallelCoalesceThreshold) &&
+                            inRange(event.end,         coalesce.end,         kParallelCoalesceThreshold) &&
+                            inRange(event.latestStart, coalesce.latestStart, kParallelCoalesceThreshold))
+                        {
+                                ++coalesce.__pr__parallel;
+                                coalesce.text = (coalesce.__pr__parallel + 1) + " parallel " + coalesce.__pr__raw.n;
+                                if (coalesce.start > event.start)
+                                        coalesce.start = event.start;
+                                if (coalesce.latestStart > event.latestStart)
+                                        coalesce.latestStart = event.latestStart;
+                                if (coalesce.end < event.end)
+                                        coalesce.end = event.end;
+                                return false; // event coalesced
+                        }
+                }
+                inter.parallels[key] = event;
+        }
+
+        return true;
+}
+
+function _closeEvent(inter, event)
+{
+        if (event.__pr__key in inter.events)
+                delete inter.events[event.__pr__key];
+}
+
+function _convertTime(t)
+{
+        var date = new Date();
+        date.setTime(t);
+        return date;
+}
+
+function processLog(logText)
+{
+        var log = null;
+        try
+        {
+                log = JSON.parse(logText);
+        }
+        catch (exc)
+        {
+                alert("JSON\n" + exc);
+                return;
+        }
+
+        if (log.version != 1)
+        {
+                alert("Unexpected version: " + log.version);
+                return;
+        }
+
+        // Convert to a timeline-like source
+        var inter =
+        {
+                threads: [],   // arrays of {name, events} objects for each thread
+                threadsEventSources: [], // event sources assigned to threads, indexes equals
+                raw: [],       // all events concantated and sorted by the time
+                bindings: {},  // interprocessed name binding (instance -> name from N logs)
+                events: {},    // interprocessed list of events on the run built from W,E,D logs
+                coalesces: {}, // put here single shot events that may get coalesced, same events in threshold are changing it to interval
+                parallels: {}, // map of events that can be coalesced in parallel
+
+                startTime: null,
+                endTime: null
+        };
+
+        while (log.records.length)
+        {
+                record = log.records.shift();
+                if (!(record.thread in inter.threads))
+                {
+                        inter.threads[record.thread] =
+                        {
+                                name: record.thread,
+                                banded: false,
+                                eventSource: null,
+                                finalEvents: [] // finall events to push to the source
+                        };
+                }
+
+                var thread = inter.threads[record.thread];
+                while (record.log.length)
+                {
+                        var raw = record.log.shift();
+                        raw.thread = thread;
+                        inter.raw.push(raw);
+                }
+        }
+
+        inter.raw.sort(function(a, b)
+        {
+                var diff = a.t - b.t;
+                if (diff)
+                        return diff;
+
+                return (a.e == "N") ? -1 :
+                       (a.e == "W") ? -1 :
+                       (a.e == "E") ? -1 :
+                       (a.e == "D") ? -1 :
+                                       1;
+        });
+
+        inter.startTime = inter.raw.length ? inter.raw[0].t : 0;
+        inter.firstInterestingEvent = inter.raw.length > 1 ? inter.raw[1].t : 0;
+        inter.endTime = inter.raw.length ? inter.raw[inter.raw.length - 1].t : 0;
+        
+        anchor = new Date(inter.startTime);
+
+        while (inter.raw.length)
+        {
+                var raw = inter.raw.shift();
+                switch (raw.e)
+                {
+                case "N": // Name binding
+                        inter.bindings[raw.i] = raw.n;
+                        break;
+                default:
+                        var event = _ensureEvent(inter, raw);
+                        switch (raw.e)
+                        {
+                        case "W": // Start of latency time (post, lock wait)
+                                if (!event.start)
+                                        event.start = _convertTime(raw.t);
+                                event.eventID.poster = raw.thread;
+                                break;
+                        case "E": // The execution it self start
+                                if (!event.latestStart)
+                                        event.latestStart = _convertTime(raw.t);
+                                if (!event.start)
+                                        event.start = event.latestStart;
+                                event.__pr__execution_thread = raw.thread;
+                                break;
+                        case "S": // A single shot event (no duration)
+                                event.start = _convertTime(raw.t);
+                                break;
+                        case "D": // The execution end
+                                event.end = _convertTime(raw.t);
+                                if (!event.start)
+                                        event.start = event.end;
+                                break;
+                        default:
+                                throw "Found unexpected record type " + raw.e;
+                        }
+
+                        // Single shot and done will move the event to the timeline
+                        // and delete the preprocessed event from inter
+                        switch (raw.e)
+                        {
+                        case "S":
+                        case "D":
+                                if (_sanitizeEvent(inter, event))
+                                {
+                                        // Using __pr__execution_thread to put interthread events
+                                        // to the thread they were executed on.  We will see
+                                        // whether it is the right way to display them.
+                                        var thread = event.__pr__execution_thread || event.__pr__raw.thread;
+                                        thread.finalEvents.push(event);
+                                }
+                                _closeEvent(inter, event);
+                        }
+                }
+        }
+
+
+        window.setTimeout(function() {
+                setupTimeline(inter);
+                for (var threadIndex in inter.threads)
+                {
+                        var thread = inter.threads[threadIndex];
+                        var events = [];
+                        for (var eventIndex in thread.finalEvents)
+                        {
+                                var event = thread.finalEvents[eventIndex];
+                                var finalEvent = new Timeline.DefaultEventSource.Event(event);
+                                events.push(finalEvent);
+                        }
+                        thread.eventSource.addMany(events);
+                }
+                
+                filtering.filterResourceByHash();
+        }, 0);
+}
+
+function loadLog(URL)
+{
+        var progress_el = document.getElementById("progress");
+        var progress_cont_el = document.getElementById("progress-container");
+
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", URL, true);
+        xhr.withCredentials = false;
+        xhr.onprogress = function(event)
+        {
+                var percentComplete = event.position * 100 / event.totalSize;
+                progress_el.style.width = percentComplete + "%";
+        }
+        xhr.onreadystatechange = function()
+        {
+                if (xhr.readyState != 4)
+                        return;
+
+                progress_cont_el.style.display = "none";
+                document.getElementById("menu").style.display = "block";
+                processLog(xhr.responseText);
+        }
+        xhr.onerror = function()
+        {
+                alert("Response HTTP code: " + xhr.status);
+        }
+        xhr.send();
+}
+
+function echo(msg)
+{
+        var log_el = document.getElementById("log");
+        log_el.innerHTML = msg;
+}
+
+var resizeTimerID = null;
+function onResize() 
+{
+        if (resizeTimerID == null) {
+                resizeTimerID = window.setTimeout(function() {
+                        resizeTimerID = null;
+                        setTimelineHeight();
+                        timeline.layout();
+                }, 200);
+        }
+}
+
+function onLoad()
+{
+  if (!VisualEventTracerService) {
+    alert("This build of firefox doesn't support visual event tracer.\nYou must build with --enable-visual-event-tracer option.");
+    return;
+  }
+  updateFileInNameSwitch();
+}
+
+function doFilterResources(parent)
+{
+        var container = document.createElement("div");
+        
+        var els = [];
+        var filter = document.createElement("input");
+        filter.className = "filter";
+        filter.type = "text";
+        filter.style.width = "560px";
+        filter.style.margin = "0 0.5em 0.5em 0";
+        filter.value = filtering._resourceFilter;
+        var refresh = function(event)
+        {
+                for (var filterIndex in els)
+                {
+                        var value = _escapeRegExp(filter.value);
+                        var filter_el = els[filterIndex];
+                        var match = filter_el._element.match(value) || filter.value.match(filter_el._element);
+                        filter_el.style.display = match ? "" : "none";
+                }
+                
+                if (event && event.keyCode == 13)
+                {
+                        filtering.filterResource(filter.value);
+                }
+        }
+        filter.onkeyup = refresh;
+        container.appendChild(filter);
+        
+        var cancel = document.createElement("span");
+        cancel.style.color = "red";
+        cancel.style.fontSize = "18px";
+        cancel.style.cursor = "pointer";
+        cancel.innerHTML = "x";
+        cancel.onmouseup = function()
+        {
+                filtering.filterResource("");
+        };
+        container.appendChild(cancel);
+        container.appendChild(document.createElement("br"));
+
+        var elements = filtering.getResourceElements();
+        for (var elementIndex in elements)
+        {
+                var element = elements[elementIndex];
+
+                var elementContainer = document.createElement("div");
+                elementContainer._element = element;
+                elementContainer.style.cursor = "pointer";
+                elementContainer.style.marginBottom = "0.5em";
+                elementContainer.style.borderBottom = "solid 1px lightblue";
+                elementContainer.onmouseup = function()
+                {
+                        filtering.filterResource(this._element);
+                }
+                elementContainer.appendChild(document.createTextNode(element));
+                elementContainer.appendChild(document.createElement("br"));
+                container.appendChild(elementContainer);
+                els.push(elementContainer);
+        }
+
+        SimileAjax.Graphics.createBubbleForContentAndPoint(container, parent.offsetLeft, 100, 600, "right", 600);
+
+        refresh();
+        setTimeout(function() { filter.focus(); }, 500); // bubble is created async...
+}
+
+function doFilterEvents(parent)
+{
+        var events = filtering.getEventNames();
+        if (!events.length)
+                return;
+
+        var container = document.createElement("div");
+        var checkboxes = [];
+        
+        for (var eventIndex in events)
+        {
+                var eventName = events[eventIndex];
+                var ns = (eventName in filtering._namespaces && eventIndex);
+                        
+                var checkBox = document.createElement("input");
+                checkBox.type = "checkbox";
+                checkBox.value = eventName;
+                checkBox.checked = filtering.isEventEnabled(eventName);
+                checkBox.onclick = function()
+                {
+                        filtering.enableEventOrNamespace(this.value, this.checked);
+                        checkboxes.forEach(function(el) 
+                        { 
+                                el.checked = filtering.isEventEnabled(el.value);
+                        });
+                        window.setTimeout(function()
+                        {
+                                timeline.paint();
+                        }, 100);
+                }
+                container.appendChild(checkBox);
+                checkboxes.push(checkBox);
+                var b = document.createElement("span");
+                b.className = ns ? "checkboxnamespace" : "checkboxevent";
+                b.appendChild(document.createTextNode(eventName));
+                container.appendChild(b);
+                
+                container.appendChild(document.createElement("br"));
+        }
+        
+        SimileAjax.Graphics.createBubbleForContentAndPoint(container, parent.offsetLeft, 100, 300, "right", 600);
+}
+
+function doShowFileInNameSwitch()
+{
+        showFileInName = !showFileInName;
+        updateFileInNameSwitch()
+        scrollState.save();
+        timeline.paint();
+        scrollState.load();
+}
+
+function updateFileInNameSwitch()
+{
+        document.getElementById("showFileInName").checked = showFileInName;
+}
+
+function doStartTracing()
+{
+  try {
+    VisualEventTracerService.start(backlog);
+    echo("Trace is running with backlog of "+backlog+"s,<br/>do your intended actions...");
+    document.getElementById("startbtn").style.display = "none";
+    document.getElementById("stopbtn").style.display = "inline-block";
+  } catch (exc) {
+    alert(exc);
+  }
+}
+
+function doStopTracing()
+{
+  try {
+    try {
+      VisualEventTracerService.stop();
+      echo("Trace stopped.");
+      document.getElementById("startbtn").style.display = "inline-block";
+      document.getElementById("stopbtn").style.display = "none";
+    } catch (ex) {
+      if (ex.result != Components.results.NS_ERROR_NOT_INITIALIZED)
+        throw ex;
+    }
+    var snapshot = VisualEventTracerService.snapshot();
+    processLog(snapshot.JSONString);
+  } catch (exc) {
+    alert(exc);
+  }
+}
+
+</script>
+</head>
+<body onload="onLoad()" onresize="onResize()">
+        <div id="menu" 
+             style="margin-top: 10px; margin-bottom: 10px; padding: 6px; border: solid 1px lightgray;">
+                <span class="button_h" onclick="doStartTracing(this)" id="startbtn">Start</span>
+                <span class="button_h hidden" onclick="doStopTracing(this)" id="stopbtn">Stop</span>
+                <span class="button" onclick="doFilterEvents(this)">filter events</span>
+                <span class="button" onclick="doFilterResources(this)">filter resource</span>
+                <span class="button" onclick="doShowFileInNameSwitch(this)"><input id="showFileInName" type="checkbox" checked="false"/>show file in name</span>
+                <a class="button" href="about:timeline#log" target="_blank">log</a>
+                <span id="log"></log>
+        </div>
+        <div id="progress-container" 
+             style="margin-top: 10px; margin-bottom: 10px; padding: 6px; height: 10px; display: none; border: solid 1px lightgray">
+                <div id="progress" 
+                     style="width: 0px; height: 10px; display: block; background-color: #aad">
+                </div>
+        </div>
+        <div id="profiler-timeline" 
+             style="height: 300px; border: 1px solid #aaa">
+        </div>
+</body>
